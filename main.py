@@ -1,23 +1,25 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
+import numpy as np
 from datetime import datetime
+import io
 
-# [1] 페이지 및 기본 설정
-st.set_page_config(page_title="3Q Independent Tier Backtester V2", layout="wide")
-st.title("🚀 3Q 티어별 독립 매매 시스템 (정밀 동기화 버전)")
+# ==========================================
+# [1] 기본 설정 및 데이터베이스
+# ==========================================
+st.set_page_config(page_title="3Q Trinity Precision V3", layout="wide")
+st.title("🚀 3Q 트리니티 정밀 검증 시스템 (Excel Sync Ver.)")
 
-# [2] QLD 핵심 분할 데이터 (날짜: 비율) - 필요시 추가
-# 엑셀 SPLIT 시트 기준 반영
+# 1. 분할(Split) DB (엑셀 SPLIT 시트 + 미래 예측 반영)
 SPLIT_DB = {
     "2012-05-11": 2.0,
     "2015-05-20": 2.0,
     "2017-07-17": 2.0,
-    "2022-01-24": 2.0, # QLD 실제 분할일 (엑셀과 날짜 하루 차이 날 수 있음 확인 필요)
-    "2025-11-20": 2.0  # 엑셀 예비 데이터 반영
+    "2022-01-24": 2.0, 
+    "2025-11-20": 2.0  # 엑셀 시트상의 미래 예측 데이터
 }
 
-# SND 모드 DB (기존 데이터 유지)
+# 2. SND 모드 DB (전체 기간)
 SND_DB = {
     "18.01.02": "D", "18.01.08": "N", "18.01.16": "D", "18.01.22": "N", "18.01.29": "D",
     "18.02.05": "D", "18.02.12": "D", "18.02.20": "S", "18.02.26": "S", "18.03.05": "N",
@@ -113,39 +115,46 @@ def get_snd_mode(target_date):
         if k <= t_str: return SND_DB[k]
     return "N"
 
-# [3] 3Q 독립 실행 엔진 (Split Logic 추가)
-def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
+# ==========================================
+# [2] 3Q 정밀 엔진 (Excel Sync)
+# ==========================================
+def run_3q_precision_engine(df, seed, fee, comp_p, comp_l, cycle_d, user_compare_list=None):
     cash = seed
     operating_seed = seed
     history = []
     accumulated_profit = 0
     update_counter = 0
 
-    # 각 요소: {매수일, 매수가, 수량, 목표가, 만기일(MOC날짜), 모드}
+    # 포지션 관리 리스트
+    # {buy_date, buy_price, qty, target_price, moc_limit_days, mode}
     positions = []
 
+    # 파라미터 정의 (S, D, N)
     PARAMS = {
         "S": {"buy": 0.04,  "sell": 0.037, "moc": 17},
         "D": {"buy": 0.006, "sell": 0.010, "moc": 25},
         "N": {"buy": 0.05,  "sell": 0.030, "moc": 2}
     }
 
-    # 데이터의 첫날부터 순회
+    # 엑셀 검증용: 사용자 입력 데이터가 있으면 인덱싱 준비
+    comp_idx = 0
+    
+    # ----------------------------------------
+    # [Start] 시뮬레이션 루프
+    # ----------------------------------------
     for i in range(1, len(df)):
         current_date = df.index[i]
         date_str = current_date.strftime("%Y-%m-%d")
-        
-        # --- [0] Split Check (매우 중요) ---
-        # 분할 발생 시 보유 물량의 수량과 목표가를 조정
+
+        # 1. Split Check (분할 반영)
         if date_str in SPLIT_DB:
             ratio = SPLIT_DB[date_str]
             for pos in positions:
                 pos['qty'] = pos['qty'] * ratio
                 pos['buy_price'] = pos['buy_price'] / ratio
                 pos['target_price'] = pos['target_price'] / ratio
-            
-            # (옵션) 시드머니 보정 로직이 필요하다면 여기에 추가
 
+        # 2. 데이터 로드 (현재 봉)
         prev_close = float(df['Close'].iloc[i-1])
         curr_open = float(df['Open'].iloc[i])
         curr_low = float(df['Low'].iloc[i])
@@ -155,7 +164,7 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
         mode = get_snd_mode(current_date)
         p = PARAMS.get(mode, PARAMS["N"])
 
-        # --- [1] 시드 갱신 (복리) ---
+        # 3. 시드 갱신 (복리)
         update_counter += 1
         if update_counter >= cycle_d:
             if accumulated_profit > 0:
@@ -165,13 +174,15 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
             accumulated_profit = 0
             update_counter = 0
 
-        # --- [2] 매도 체크 ---
+        # 4. [매도 체크] (Sell Logic)
         next_positions = []
         for pos in positions:
             is_sold = False
             
             # (A) 목표가 익절
+            # 엑셀 로직: IF(High > Target, ...)
             if curr_high >= pos['target_price']:
+                # 갭상승 보정: 시가가 목표가보다 높으면 시가 체결
                 sell_price = pos['target_price']
                 if curr_open > sell_price: sell_price = curr_open 
                 
@@ -198,12 +209,14 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
         
         positions = next_positions
 
-        # --- [3] 매수 체크 ---
+        # 5. [매수 체크] (Buy Logic)
         target_buy_price = prev_close * (1 - p["buy"])
         current_tier_index = len(positions) + 1
 
+        # 엑셀 로직: IF(Low < Target, ...)
         if curr_low <= target_buy_price and current_tier_index <= 8:
             
+            # 티어별 배수
             if current_tier_index in [1, 2, 3, 4, 7]: unit_multiplier = 1.0
             elif current_tier_index == 5: unit_multiplier = 3.6
             elif current_tier_index == 6: unit_multiplier = 3.0
@@ -211,9 +224,11 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
             else: unit_multiplier = 1.0
 
             buy_amt = (operating_seed / 8) * unit_multiplier
+            # [중요] 수량 계산은 타겟가 기준 (엑셀 floor 함수 등 고려하여 int 처리)
             buy_qty = int(buy_amt / target_buy_price)
             if buy_qty < 1: buy_qty = 1
 
+            # 갭하락 보정: 시가가 타겟가보다 낮으면 시가 체결
             buy_price = target_buy_price
             if curr_open < target_buy_price: buy_price = curr_open
 
@@ -233,86 +248,163 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
                 }
                 positions.append(new_pos)
 
-        # --- [4] 자산 평가 ---
+        # 6. 자산 평가 및 기록
         equity_val = sum([p['qty'] * curr_close for p in positions])
         total_asset = cash + equity_val
         
-        history.append({'Date': current_date, 'Total': total_asset, 'Mode': mode, 'Active_Tiers': len(positions)})
+        # 7. 검증 데이터와 비교
+        diff_flag = ""
+        user_val = 0.0
+        if user_compare_list and comp_idx < len(user_compare_list):
+            user_val = user_compare_list[comp_idx]
+            # 오차범위 1달러 이상이면 불일치로 간주
+            if abs(total_asset - user_val) > 1.0:
+                diff_flag = "❌ 불일치"
+            else:
+                diff_flag = "✅ 일치"
+            comp_idx += 1
+
+        history.append({
+            'Date': current_date, 
+            'Total': total_asset, 
+            'Mode': mode, 
+            'Active_Tiers': len(positions),
+            'Excel_Value': user_val if user_compare_list else 0,
+            'Sync_Status': diff_flag
+        })
         
     return pd.DataFrame(history)
 
-# [4] 사이드바 설정
-with st.sidebar:
-    st.header("📋 백테스트 설정")
-    
-    # 데이터 소스 선택
-    data_source = st.radio("데이터 소스 선택", ["Yahoo Finance (기본)", "Excel Raw Upload (정밀)"])
-    
-    if data_source == "Yahoo Finance (기본)":
-        ticker = st.text_input("분석 종목 (Ticker)", value="QLD").upper()
-        min_d, max_d = datetime(2018, 1, 1), datetime(2026, 1, 31)
-        col1, col2 = st.columns(2)
-        s_date = col1.date_input("시작일", value=datetime(2025, 1, 1))
-        e_date = col2.date_input("종료일", value=max_d)
-    else:
-        uploaded_file = st.file_uploader("RAW.csv 파일 업로드", type=['csv'])
-        st.info("파일 형식: Date, Open, High, Low, Close 컬럼 필수")
 
+# ==========================================
+# [3] 사이드바 설정
+# ==========================================
+with st.sidebar:
+    st.header("📋 설정 패널")
+    
+    uploaded_file = st.file_uploader("📂 RAW.csv 업로드 (필수)", type=['csv'])
+    
     seed = st.number_input("초기 원금 ($)", value=10000, step=1000)
     fee_rate = st.number_input("거래 수수료 (%)", value=0.0, format="%.3f") / 100
     
     st.divider()
-    st.header("🔄 복리 정책")
-    comp_profit = st.slider("이익 복리 반영 (%)", 0, 100, 90) / 100
-    comp_loss = st.slider("손실 복리 반영 (%)", 0, 100, 20) / 100
+    st.markdown("**복리 정책**")
+    comp_profit = st.slider("이익 재투자 (%)", 0, 100, 90) / 100
+    comp_loss = st.slider("손실 반영 (%)", 0, 100, 20) / 100
     update_cycle = st.number_input("갱신 주기 (일)", value=6, min_value=1)
+    
+    st.divider()
+    st.markdown("**검증 데이터 입력**")
+    excel_data_str = st.text_area("엑셀 자산열 복사/붙여넣기", 
+                                  placeholder="$10,000\n$10,004\n...", height=150)
 
-# [5] 메인 실행
-if st.button("📊 3Q 독립 엔진 실행 (V2)", type="primary", use_container_width=True):
-    with st.spinner("데이터 로딩 및 Split 보정 중..."):
-        df_raw = pd.DataFrame()
-
-        # A. 데이터 로드 로직
-        if data_source == "Yahoo Finance (기본)":
-            df_raw = yf.download(ticker, start=s_date, end=e_date, auto_adjust=False)
-            if isinstance(df_raw.columns, pd.MultiIndex):
-                df_raw.columns = df_raw.columns.get_level_values(0)
-        
-        elif data_source == "Excel Raw Upload (정밀)" and uploaded_file is not None:
-            df_raw = pd.read_csv(uploaded_file)
-            # 엑셀 파일 컬럼 매핑 (대소문자 처리)
-            df_raw.columns = [c.upper().strip() for c in df_raw.columns]
-            df_raw['DATE'] = pd.to_datetime(df_raw['DATE'])
-            df_raw = df_raw.set_index('DATE').sort_index()
-            # 필요 컬럼 존재 확인
-            required = ['OPEN', 'HIGH', 'LOW', 'CLOSE']
-            if all(col in df_raw.columns for col in required):
-                df_raw = df_raw[required] # 컬럼 순서 정렬
-                # 대문자를 소문자 첫글자(Title)형태로 변환 (함수 호환성)
-                df_raw.columns = ['Open', 'High', 'Low', 'Close']
-            else:
-                st.error("CSV 파일에 OPEN, HIGH, LOW, CLOSE 컬럼이 있어야 합니다.")
-                st.stop()
-        
-        # B. 백테스트 실행
-        if not df_raw.empty:
-            res = run_3q_engine(df_raw, seed, fee_rate, comp_profit, comp_loss, update_cycle)
-            
-            if not res.empty:
-                final_val = res['Total'].iloc[-1]
-                st.subheader(f"🏁 최종 자산: ${final_val:,.2f}")
+# ==========================================
+# [4] 메인 실행 로직
+# ==========================================
+if st.button("📊 정밀 백테스트 실행", type="primary", use_container_width=True):
+    if uploaded_file is None:
+        st.error("🚨 정확한 검증을 위해 'RAW.csv' 파일을 업로드해주세요.")
+    else:
+        with st.spinner("데이터 분석 및 엔진 가동 중..."):
+            # A. 데이터 로드 및 전처리
+            try:
+                df_raw = pd.read_csv(uploaded_file)
+                # 컬럼명 표준화 (공백제거, 대문자)
+                df_raw.columns = [c.upper().strip() for c in df_raw.columns]
                 
-                # 결과 탭
-                t1, t2 = st.tabs(["차트/성과", "로그 데이터"])
-                with t1:
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("총 수익률", f"{(final_val/seed-1)*100:.2f}%")
-                    c2.metric("MDD (추정)", f"{((res['Total'].min() - seed)/seed)*100:.2f}%") # 단순화
-                    c3.metric("총 거래일수", len(res))
-                    st.line_chart(res.set_index('Date')['Total'])
-                with t2:
-                    st.dataframe(res)
+                # DATE 컬럼 처리
+                if 'DATE' in df_raw.columns:
+                    df_raw['DATE'] = pd.to_datetime(df_raw['DATE'])
+                    df_raw = df_raw.set_index('DATE').sort_index()
+                else:
+                    st.error("CSV 파일에 'DATE' 컬럼이 없습니다.")
+                    st.stop()
+                
+                # 필수 가격 컬럼 존재 확인 및 매핑
+                req_cols = {'OPEN': 'Open', 'HIGH': 'High', 'LOW': 'Low', 'CLOSE': 'Close'}
+                if not all(col in df_raw.columns for col in req_cols.keys()):
+                    st.error(f"CSV 파일에 다음 컬럼이 모두 있어야 합니다: {list(req_cols.keys())}")
+                    st.stop()
+                
+                df_raw = df_raw.rename(columns=req_cols)[['Open', 'High', 'Low', 'Close']]
+                
+                # B. 사용자 검증 데이터 파싱
+                user_list = []
+                if excel_data_str:
+                    # $ , 줄바꿈 등 제거하고 숫자 리스트로 변환
+                    cleaned = excel_data_str.replace("$", " ").replace(",", "").replace("\n", " ")
+                    user_list = [float(x) for x in cleaned.split() if x.strip()]
+                    
+                    # 사용자가 입력한 데이터의 개수만큼만 날짜 슬라이싱 (시작일 맞추기 위함)
+                    # *가정: 사용자가 입력한 첫 데이터가 시뮬레이션 시작일의 자산이라고 가정*
+                    if len(user_list) > 0:
+                        # 데이터의 끝에서부터 user_list 길이만큼만 가져와서 매칭해볼 수도 있고
+                        # 혹은 2025-01-02 부터 시작한다고 가정할 수도 있음.
+                        # 여기서는 정부장님 케이스(2025-01-02 시작)에 맞춰 25년 데이터 필터링
+                        df_raw = df_raw[df_raw.index >= "2025-01-02"]
+
+            except Exception as e:
+                st.error(f"데이터 파일 읽기 오류: {e}")
+                st.stop()
+
+            # C. 엔진 실행
+            res = run_3q_precision_engine(
+                df_raw, seed, fee_rate, comp_profit, comp_loss, update_cycle, 
+                user_compare_list=user_list
+            )
+
+            # D. 결과 출력
+            if not res.empty:
+                final_asset = res['Total'].iloc[-1]
+                
+                # 상단 메트릭
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("최종 자산", f"${final_asset:,.2f}")
+                c2.metric("수익률", f"{(final_asset/seed - 1)*100:.2f}%")
+                
+                # 불일치 발생 여부 확인
+                mismatch = res[res['Sync_Status'] == "❌ 불일치"]
+                if not mismatch.empty:
+                    first_fail_date = mismatch['Date'].iloc[0].strftime("%Y-%m-%d")
+                    c3.metric("동기화 상태", "⚠️ 불일치 발생", delta_color="inverse")
+                    c4.metric("최초 불일치일", first_fail_date)
+                    st.error(f"🚨 **{first_fail_date}** 부터 엑셀값과 달라집니다. 아래 로그 탭에서 확인하세요.")
+                else:
+                    c3.metric("동기화 상태", "✅ 완전 일치")
+                    if user_list:
+                        st.success("🎉 축하합니다! 엑셀 자산 흐름과 100% 일치합니다.")
+
+                # 탭 구성
+                tab1, tab2, tab3 = st.tabs(["📊 차트 비교", "📝 상세 로그 (동기화)", "📂 원본 데이터"])
+                
+                with tab1:
+                    chart_data = res.set_index('Date')[['Total']]
+                    if user_list:
+                        chart_data['Excel'] = res.set_index('Date')['Excel_Value']
+                    st.line_chart(chart_data)
+                
+                with tab2:
+                    st.markdown("### 🔍 일자별 상세 거래 및 검증 로그")
+                    
+                    # 표시할 컬럼 선택
+                    cols = ['Date', 'Total', 'Excel_Value', 'Sync_Status', 'Active_Tiers', 'Mode']
+                    
+                    # 스타일링: 불일치 행 강조
+                    def highlight_diff(row):
+                        if row['Sync_Status'] == "❌ 불일치":
+                            return ['background-color: #ffcccc'] * len(row)
+                        return [''] * len(row)
+
+                    st.dataframe(
+                        res[cols].style.format({
+                            'Total': "{:,.2f}", 
+                            'Excel_Value': "{:,.2f}"
+                        }).apply(highlight_diff, axis=1),
+                        use_container_width=True,
+                        height=600
+                    )
+                    
+                with tab3:
+                    st.dataframe(df_raw)
             else:
-                st.warning("백테스트 결과가 없습니다. 날짜 범위를 확인하세요.")
-        else:
-            st.error("데이터를 불러올 수 없습니다.")
+                st.warning("결과 데이터가 없습니다.")
