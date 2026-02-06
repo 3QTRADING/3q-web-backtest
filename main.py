@@ -5,11 +5,11 @@ import numpy as np
 from datetime import datetime
 import plotly.graph_objects as go
 
-# [1] 페이지 설정
+# [1] 페이지 및 레이아웃 설정
 st.set_page_config(page_title="3Q SND Tier-Weight Backtester", layout="wide")
 st.title("🚀 3Q 가변 SND + 8분할 비중 시스템")
 
-# [2] SND 데이터 DB (2018~2026)
+# [2] SND 데이터 DB (2018~2026) - 엔진 내장
 SND_DB = {
     "18.01.02": "D", "18.01.08": "N", "18.01.16": "D", "18.01.22": "N", "18.01.29": "D",
     "18.02.05": "D", "18.02.12": "D", "18.02.20": "S", "18.02.26": "S", "18.03.05": "N",
@@ -106,14 +106,12 @@ def get_snd_mode(target_date):
     return "N"
 
 # [3] 3Q 가변 SND + 8분할 티어 비중 + 정밀 복리 엔진
-def run_3q_engine(df, seed, fee=0):
+def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
     cash, shares = seed, 0
-    operating_seed = seed # Q 반영 갱신용 원금
+    operating_seed = seed
     history = []
     current_tier = 1 
-    accumulated_profit = 0 # 갱신 전까지 모으는 수익
-    
-    # 반영 갱신 주기 6일 카운터
+    accumulated_profit = 0 
     update_counter = 0
 
     for i in range(1, len(df)):
@@ -123,13 +121,13 @@ def run_3q_engine(df, seed, fee=0):
         
         mode = get_snd_mode(date)
         
-        # --- 6일 주기 복리 반영 로직 (이익 90%, 손실 20%) ---
+        # --- 복리 반영 로직 (이익/손실 비율 및 주기 설정 반영) --- [cite: 2025-12-31]
         update_counter += 1
-        if update_counter >= 6:
+        if update_counter >= cycle_d:
             if accumulated_profit > 0:
-                operating_seed += (accumulated_profit * 0.9) # 이익복리 90% 반영
+                operating_seed += (accumulated_profit * comp_p) 
             else:
-                operating_seed += (accumulated_profit * 0.2) # 손실복리 20% 반영
+                operating_seed += (accumulated_profit * comp_l) 
             
             cash = operating_seed - (shares * curr_close)
             accumulated_profit = 0
@@ -140,10 +138,9 @@ def run_3q_engine(df, seed, fee=0):
         elif mode == "N": b_gear, s_gear, s_type = 0.96, 1.037, "LOC"
         else:             b_gear, s_gear, s_type = 0.92, 1.055, "MOC"
 
-        # --- 매수 로직 (8분할 티어 가변 비중) ---
+        # --- 매수 로직 (8분할 티어 가변 비중) --- [cite: 2025-12-31]
         target_buy = np.floor(prev_close * b_gear * 100) / 100
         if curr_low <= target_buy and current_tier <= 8:
-            # 티어별 매수 수량 결정
             if current_tier in [1, 2, 3, 4, 7]: buy_qty = 1 
             elif current_tier == 5: buy_qty = (operating_seed / 8 / curr_close) * 3.6 
             elif current_tier == 6: buy_qty = (operating_seed / 8 / curr_close) * 3.0 
@@ -155,26 +152,53 @@ def run_3q_engine(df, seed, fee=0):
                 shares += buy_qty
                 current_tier += 1
 
-        # --- 매도 로직 (익절 시 티어 리셋 및 수익 적립) ---
+        # --- 매도 로직 (익절 시 티어 리셋 및 수익 적립) --- [cite: 2025-12-31]
         target_sell = round(prev_close * s_gear, 2)
         if curr_high >= target_sell and shares > 0:
             sell_price = curr_close if s_type == "MOC" else target_sell
             sell_val = shares * sell_price
             
-            # 수익 계산 (실현 손익 적립)
-            profit = sell_val - (shares * (sell_val/shares)) # 수수료 무료 기준
+            profit = sell_val - (shares * (sell_val/shares)) 
             accumulated_profit += profit
             
-            cash += sell_val
+            cash += sell_val * (1 - fee)
             shares = 0
-            current_tier = 1 # 티어 리셋
+            current_tier = 1 
 
         history.append({'Date': date, 'Total': cash + (shares * curr_close), 'Mode': mode})
     return pd.DataFrame(history)
 
-# [4] 사이드바 및 UI
+# [4] 사이드바 사용자 입력란 (전면 배치) [cite: 2025-12-31]
 with st.sidebar:
-    st.header("⚙️ 백테스트 설정")
-    ticker = st.text_input("종목 심볼", value="QLD").upper()
+    st.header("📋 백테스트 설정")
+    ticker = st.text_input("분석 종목 (Ticker)", value="QLD").upper()
+    
     min_d, max_d = datetime(2018, 1, 1), datetime(2026, 1, 31)
-    s_date = st.date_input("시작일", value=datetime(2025, 1, 1), min_value=min_d, max_value=max_d)
+    col1, col2 = st.columns(2)
+    s_date = col1.date_input("시작일", value=datetime(2025, 1, 1), min_value=min_d, max_value=max_d)
+    e_date = col2.date_input("종료일", value=max_d, min_value=min_d, max_value=max_d)
+    
+    seed = st.number_input("초기 원금 ($)", value=10000, step=1000)
+    fee_rate = st.number_input("거래 수수료 (%)", value=0.0, format="%.3f") / 100
+    
+    st.divider()
+    st.header("🔄 복리 및 갱신 정책") [cite: 2025-12-31]
+    comp_profit = st.slider("이익 복리 반영 비율 (%)", 0, 100, 90) / 100
+    comp_loss = st.slider("손실 복리 반영 비율 (%)", 0, 100, 20) / 100
+    update_cycle = st.number_input("반영 갱신 주기 (일)", value=6, min_value=1)
+
+# [5] 메인 화면 실행 및 결과
+if st.button("📊 3Q 가변 엔진 실행", type="primary", use_container_width=True):
+    with st.spinner("복리 연산 및 가변 비중 분석 중..."):
+        df_raw = yf.download(ticker, start=s_date, end=e_date, auto_adjust=True)
+        if not df_raw.empty:
+            res = run_3q_engine(df_raw, seed, fee_rate, comp_profit, comp_loss, update_cycle)
+            
+            final_val = res['Total'].iloc[-1]
+            st.subheader(f"🏁 {ticker} 성과 분석 결과")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("최종 자산", f"${final_val:,.2f}")
+            c2.metric("총 수익률", f"{(final_val/seed-1)*100:.2f}%")
+            c3.metric("최대 자산", f"${res['Total'].max():,.2f}")
+            
+            st.line_chart(res.set_index('Date')['Total'])
