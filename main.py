@@ -8,9 +8,8 @@ import plotly.graph_objects as go
 # [1] 페이지 설정
 st.set_page_config(page_title="3Q SND Pro Backtester", layout="wide")
 st.title("🚀 3Q 실전 가변 SND 백테스트 시스템")
-st.caption("2018년~2026년 1월 데이터 및 주 단위 S/N/D 로직 적용")
 
-# [2] 부장님이 주신 주차별 SND 데이터 (엔진 내장)
+# [2] SND 데이터 (2011~2026) - 엔진 내장
 SND_DATA = {
     "18.01.02": "D", "18.01.08": "N", "18.01.16": "D", "18.01.22": "N", "18.01.29": "D",
     "18.02.05": "D", "18.02.12": "D", "18.02.20": "S", "18.02.26": "S", "18.03.05": "N",
@@ -99,17 +98,17 @@ SND_DATA = {
     "26.01.20": "N", "26.01.26": "D", "26.02.02": "D"
 }
 
+# 날짜에 맞는 SND 모드 호출
 def get_snd_mode(target_date):
-    # 가장 가까운 과거의 SND 데이터 날짜를 찾음
     sorted_dates = sorted(SND_DATA.keys(), reverse=True)
     target_str = target_date.strftime("%y.%m.%d")
     for d in sorted_dates:
         if d <= target_str:
             return SND_DATA[d]
-    return "N" # 기본값
+    return "N"
 
-# [3] 가변 SND 엔진
-def run_3q_snd_pro(df, seed, fee=0):
+# [3] 가변 SND 엔진 로직
+def run_3q_variable_engine(df, seed, fee_rate):
     cash, shares = seed, 0
     history = []
     
@@ -120,72 +119,71 @@ def run_3q_snd_pro(df, seed, fee=0):
         curr_high = float(df['High'].iloc[i])
         curr_close = float(df['Close'].iloc[i])
         
-        # 주 단위 S/N/D 판별
         mode = get_snd_mode(date)
         
-        # 모드별 가변 매매 기어 설정
-        if mode == "S":   # Safe: 적극적 매수
-            buy_gear, sell_gear, sell_type = 0.98, 1.025, "LOC"
-        elif mode == "N": # Normal: 표준 매매
-            buy_gear, sell_gear, sell_type = 0.96, 1.037, "LOC"
-        else:             # Danger: 보수적 매매 (종가 탈출 위주)
-            buy_gear, sell_gear, sell_type = 0.92, 1.055, "MOC"
+        # 모드별 가변 기어 세팅
+        if mode == "S":   # Safe
+            b_gear, s_gear, s_type = 0.98, 1.025, "LOC"
+        elif mode == "N": # Normal
+            b_gear, s_gear, s_type = 0.96, 1.037, "LOC"
+        else:             # Danger
+            b_gear, s_gear, s_type = 0.92, 1.055, "MOC"
 
-        # 매수 로직 (1/8 비중)
-        target_buy = np.floor(prev_close * buy_gear * 100) / 100
+        # 매수 (1/8 비중)
+        target_buy = np.floor(prev_close * b_gear * 100) / 100
         if curr_low <= target_buy:
             buy_limit = seed / 8
             if cash >= buy_limit:
-                exec_price = min(target_buy, curr_close)
-                qty = buy_limit / exec_price
-                cash -= buy_limit # 수수료 0원 반영
+                exec_p = min(target_buy, curr_close)
+                qty = buy_limit / exec_p
+                cash -= (buy_limit * (1 + fee_rate))
                 shares += qty
 
-        # 매도 로직
-        target_sell = round(prev_close * sell_gear, 2)
+        # 매도
+        target_sell = round(prev_close * s_gear, 2)
         if curr_high >= target_sell and shares > 0:
-            sell_price = curr_close if sell_type == "MOC" else target_sell
-            cash += shares * sell_price
+            sell_p = curr_close if s_type == "MOC" else target_sell
+            cash += shares * sell_p * (1 - fee_rate)
             shares = 0
 
-        history.append({'Date': date, 'Total': cash + (shares * curr_close), 'Mode': mode})
+        history.append({'날짜': date, '총자산': cash + (shares * curr_close), '모드': mode})
     return pd.DataFrame(history)
 
-# [4] 메인 UI
+# [4] 사이드바 (사용자 설정 개방) [cite: 2025-12-31]
 with st.sidebar:
     st.header("📝 백테스트 설정")
     ticker = st.text_input("종목 심볼", value="QLD").upper()
-    # 18년도부터 26년 1월까지 고정
-    start_d = datetime(2018, 1, 1)
-    end_d = datetime(2026, 1, 31)
-    seed = 10000 # 1만 달러 고정
     
-    st.info(f"기간: {start_d.date()} ~ {end_d.date()}")
-    st.info(f"시작 원금: ${seed:,}")
-    st.info("거래 수수료: $0 (무료)")
+    # 기본 시작일을 25년 1월로 설정
+    col1, col2 = st.columns(2)
+    s_date = col1.date_input("시작일", datetime(2025, 1, 1))
+    e_date = col2.date_input("종료일", datetime(2026, 1, 31))
+    
+    # 시작 원금 및 수수료 설정 자유화
+    seed_input = st.number_input("초기 자본 ($)", value=10000, step=1000)
+    fee_input = st.number_input("수수료 (%)", value=0.0, format="%.3f") / 100
 
+# [5] 실행 및 결과 출력
 if st.button("📊 SND 가변 백테스트 실행", type="primary", use_container_width=True):
-    with st.spinner("야후 파이낸스 DB 호출 및 가변 로직 분석 중..."):
-        df_stock = yf.download(ticker, start=start_d, end=end_d, auto_adjust=True)
+    with st.spinner("데이터 분석 중..."):
+        df_raw = yf.download(ticker, start=s_date, end=e_date, auto_adjust=True)
         
-        if not df_stock.empty:
-            res = run_3q_snd_pro(df_stock, seed)
+        if not df_raw.empty:
+            res = run_3q_variable_engine(df_raw, seed_input, fee_input)
             
-            # 최종 결과 출력
-            final_val = res['Total'].iloc[-1]
-            st.subheader("🏁 3Q 가변 SND 결과 보고서")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("최종 자산", f"${final_val:,.2f}")
-            c2.metric("총 수익률", f"{(final_val/seed-1)*100:.2f}%")
+            # 지표 (U17~U21 구조)
+            final_val = res['총자산'].iloc[-1]
+            st.subheader(f"🏁 {ticker} 가변 SND 분석 결과")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("최종 자산", f"${final_val:,.2f}")
+            m2.metric("총 수익률", f"{(final_val/seed_input-1)*100:.2f}%")
+            m3.metric("최종 판별 모드", res['모드'].iloc[-1])
             
-            # 모드 분포 확인
-            mode_counts = res['Mode'].value_counts()
-            c3.metric("가장 많이 판별된 모드", mode_counts.index[0])
-            
-            # 그래프
+            # 차트
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=res['Date'], y=res['Total'], name="자산 변화", line=dict(color="#3b82f6", width=2)))
+            fig.add_trace(go.Scatter(x=res['날짜'], y=res['총자산'], name="자산 변화", line=dict(color="#3b82f6", width=2)))
             fig.update_layout(hovermode="x unified", template="plotly_white")
             st.plotly_chart(fig, use_container_width=True)
+            
         else:
             st.error("데이터 로드 실패")
