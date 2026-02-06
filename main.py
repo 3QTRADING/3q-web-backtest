@@ -8,9 +8,8 @@ import plotly.graph_objects as go
 # [1] 페이지 설정
 st.set_page_config(page_title="3Q SND Tier-Weight Backtester", layout="wide")
 st.title("🚀 3Q 가변 SND + 8분할 비중 시스템")
-st.info("1~4티어(1주), 5티어(3.6배), 6티어(3배), 7티어(1주), 8티어(4배) 비중 조절 로직 적용") [cite: 2025-12-31]
 
-# [2] SND 데이터 DB (부장님 제공 데이터 2018~2026) [cite: 2025-12-31]
+# [2] SND 데이터 DB (2018~2026)
 SND_DB = {
     "18.01.02": "D", "18.01.08": "N", "18.01.16": "D", "18.01.22": "N", "18.01.29": "D",
     "18.02.05": "D", "18.02.12": "D", "18.02.20": "S", "18.02.26": "S", "18.03.05": "N",
@@ -106,12 +105,17 @@ def get_snd_mode(target_date):
         if k <= t_str: return SND_DB[k]
     return "N"
 
-# [3] 가변 SND + 8분할 티어 비중 엔진 [cite: 2025-12-31]
-def run_3q_tier_engine(df, seed, fee=0):
+# [3] 3Q 가변 SND + 8분할 티어 비중 + 정밀 복리 엔진
+def run_3q_engine(df, seed, fee=0):
     cash, shares = seed, 0
+    operating_seed = seed # Q 반영 갱신용 원금
     history = []
-    current_tier = 1 # 1분할부터 시작
+    current_tier = 1 
+    accumulated_profit = 0 # 갱신 전까지 모으는 수익
     
+    # 반영 갱신 주기 6일 카운터
+    update_counter = 0
+
     for i in range(1, len(df)):
         date = df.index[i]
         prev_close = float(df['Close'].iloc[i-1])
@@ -119,40 +123,53 @@ def run_3q_tier_engine(df, seed, fee=0):
         
         mode = get_snd_mode(date)
         
+        # --- 6일 주기 복리 반영 로직 (이익 90%, 손실 20%) ---
+        update_counter += 1
+        if update_counter >= 6:
+            if accumulated_profit > 0:
+                operating_seed += (accumulated_profit * 0.9) # 이익복리 90% 반영
+            else:
+                operating_seed += (accumulated_profit * 0.2) # 손실복리 20% 반영
+            
+            cash = operating_seed - (shares * curr_close)
+            accumulated_profit = 0
+            update_counter = 0
+
         # 모드별 가변 기어 세팅
         if mode == "S":   b_gear, s_gear, s_type = 0.98, 1.025, "LOC"
         elif mode == "N": b_gear, s_gear, s_type = 0.96, 1.037, "LOC"
         else:             b_gear, s_gear, s_type = 0.92, 1.055, "MOC"
 
-        # --- 매수 로직 (8분할 티어 비중 적용) [cite: 2025-12-31] ---
+        # --- 매수 로직 (8분할 티어 가변 비중) ---
         target_buy = np.floor(prev_close * b_gear * 100) / 100
-        
         if curr_low <= target_buy and current_tier <= 8:
-            # 티어별 비중 계산 [cite: 2025-12-31]
-            if current_tier in [1, 2, 3, 4, 7]: 
-                buy_qty = 1 # 1~4티어, 7티어는 무조건 1주 [cite: 2025-12-31]
-            elif current_tier == 5: 
-                buy_qty = (seed / 8 / curr_close) * 3.6 # 5티어: 3.6배 [cite: 2025-12-31]
-            elif current_tier == 6: 
-                buy_qty = (seed / 8 / curr_close) * 3.0 # 6티어: 3배 [cite: 2025-12-31]
-            elif current_tier == 8: 
-                buy_qty = (seed / 8 / curr_close) * 4.0 # 8티어: 4배 [cite: 2025-12-31]
+            # 티어별 매수 수량 결정
+            if current_tier in [1, 2, 3, 4, 7]: buy_qty = 1 
+            elif current_tier == 5: buy_qty = (operating_seed / 8 / curr_close) * 3.6 
+            elif current_tier == 6: buy_qty = (operating_seed / 8 / curr_close) * 3.0 
+            elif current_tier == 8: buy_qty = (operating_seed / 8 / curr_close) * 4.0 
             
             buy_cost = buy_qty * min(target_buy, curr_close)
             if cash >= buy_cost:
                 cash -= buy_cost
                 shares += buy_qty
-                current_tier += 1 # 다음 티어로 이동
+                current_tier += 1
 
-        # --- 매도 로직 (익절 시 티어 리셋) [cite: 2025-12-31] ---
+        # --- 매도 로직 (익절 시 티어 리셋 및 수익 적립) ---
         target_sell = round(prev_close * s_gear, 2)
         if curr_high >= target_sell and shares > 0:
             sell_price = curr_close if s_type == "MOC" else target_sell
-            cash += shares * sell_price
+            sell_val = shares * sell_price
+            
+            # 수익 계산 (실현 손익 적립)
+            profit = sell_val - (shares * (sell_val/shares)) # 수수료 무료 기준
+            accumulated_profit += profit
+            
+            cash += sell_val
             shares = 0
-            current_tier = 1 # 익절 시 다시 1티어로 리셋 [cite: 2025-12-31]
+            current_tier = 1 # 티어 리셋
 
-        history.append({'Date': date, 'Total': cash + (shares * curr_close), 'Mode': mode, 'Tier': current_tier - 1})
+        history.append({'Date': date, 'Total': cash + (shares * curr_close), 'Mode': mode})
     return pd.DataFrame(history)
 
 # [4] 사이드바 및 UI
@@ -161,26 +178,3 @@ with st.sidebar:
     ticker = st.text_input("종목 심볼", value="QLD").upper()
     min_d, max_d = datetime(2018, 1, 1), datetime(2026, 1, 31)
     s_date = st.date_input("시작일", value=datetime(2025, 1, 1), min_value=min_d, max_value=max_d)
-    e_date = st.date_input("종료일", value=max_d, min_value=min_d, max_value=max_d)
-    seed = st.number_input("초기 원금 ($)", value=10000)
-    st.info("비중: 1-4T(1주), 5T(3.6배), 6T(3배), 7T(1주), 8T(4배)") [cite: 2025-12-31]
-
-if st.button("📊 8분할 티어 백테스트 실행", type="primary", use_container_width=True):
-    with st.spinner("가변 비중 엔진 가동 중..."):
-        df_raw = yf.download(ticker, start=s_date, end=e_date, auto_adjust=True)
-        if not df_raw.empty:
-            res = run_3q_tier_engine(df_raw, seed)
-            
-            # 성과 지표
-            final_val = res['Total'].iloc[-1]
-            st.subheader(f"🏁 {ticker} 8분할 성과 보고서")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("최종 자산", f"${final_val:,.2f}")
-            c2.metric("수익률", f"{(final_val/seed-1)*100:.2f}%")
-            c3.metric("최대 도달 티어", f"{res['Tier'].max()}단계")
-            
-            # 자산 변화 그래프
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=res['Date'], y=res['Total'], name="자산 변화", line=dict(color="#3b82f6", width=2)))
-            fig.update_layout(hovermode="x unified", template="plotly_white")
-            st.plotly_chart(fig, use_container_width=True)
