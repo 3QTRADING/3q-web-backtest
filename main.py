@@ -1,207 +1,183 @@
-# @title 🚀 3Q 트리니티 Pro (Algori-C 스타일 웹버전)
-# ⚠️ 이 코드를 구글 코랩에 붙여넣고 실행하세요.
+/**
+ * 🚀 3Q 트리니티 V7 (컬럼 자동 인식 & 에러 방지판)
+ * RAW 시트의 열 순서가 바뀌어도 알아서 찾아 계산합니다.
+ */
 
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime
-import io
+function runTrinityEngine() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetRaw = ss.getSheetByName("RAW");
+  const sheetRecord = ss.getSheetByName("RECORD");
 
-# ---------------------------------------------------------
-# [1] 엔진 설정 (정부장님 룰 100% 반영)
-# ---------------------------------------------------------
-SPLIT_DB = {"2025-11-20": 2.0}
-SND_DB = {
+  if (!sheetRaw || !sheetRecord) {
+    Browser.msgBox("❌ 오류: 'RAW' 시트와 'RECORD' 시트가 없습니다. 이름을 확인해주세요.");
+    return;
+  }
+
+  // 1. 데이터 로딩
+  const data = sheetRaw.getDataRange().getValues();
+  if (data.length < 2) {
+    Browser.msgBox("❌ 오류: RAW 시트에 데이터가 없습니다.");
+    return;
+  }
+
+  // 2. 컬럼 위치 찾기 (자동 인식)
+  const headers = data[0].map(h => String(h).toUpperCase().trim());
+  const idxDate = headers.indexOf("DATE");
+  const idxOpen = headers.indexOf("OPEN");
+  const idxHigh = headers.indexOf("HIGH");
+  const idxLow = headers.indexOf("LOW");
+  const idxClose = headers.indexOf("CLOSE");
+
+  // 필수 컬럼 체크
+  if (idxDate < 0 || idxOpen < 0 || idxHigh < 0 || idxLow < 0 || idxClose < 0) {
+    Browser.msgBox("❌ 오류: RAW 시트 1행에 DATE, OPEN, HIGH, LOW, CLOSE 가 정확히 적혀있어야 합니다.");
+    return;
+  }
+
+  // 3. 설정값 (정부장님 룰)
+  let cash = 10000;      
+  let op_seed = 10000;
+  const cycle = 6;
+  
+  // SND 모드 스케줄
+  const snd_schedule = {
     "25.01.06": "D", "25.01.13": "D", "25.01.21": "N", "25.01.27": "S",
     "25.02.03": "D", "25.02.10": "N", "25.02.18": "D", "25.02.24": "S",
     "25.03.03": "D", "25.03.10": "D", "25.03.17": "D", "25.03.24": "D",
     "25.03.31": "D", "25.04.07": "D", "25.04.14": "S", "25.04.21": "D",
     "25.04.28": "S", "25.05.05": "S", "25.05.12": "S", "25.05.19": "N",
     "25.05.27": "D"
-}
+  };
 
-def get_snd_mode(d):
-    t = d.strftime("%y.%m.%d")
-    for k in sorted(SND_DB.keys(), reverse=True):
-        if k <= t: return SND_DB[k]
-    return "N"
+  const PARAMS = {
+    "S": {buy: 0.04, sell: 0.037, moc: 17},
+    "D": {buy: 0.006, sell: 0.010, moc: 25},
+    "N": {buy: 0.05, sell: 0.030, moc: 2}
+  };
 
-def run_simulation(df, start_seed):
-    cash = start_seed
-    op_seed = start_seed
-    positions = []
-    history = []
-    cycle = 6
-    profit_accum = 0
-    day_cnt = 0
+  let positions = [];
+  let logs = [];
+  let profit_accum = 0;
+  let day_cnt = 0;
+  
+  // 출력 헤더
+  logs.push(["날짜", "모드", "티어", "이벤트", "현금", "주식평가금", "총자산"]);
 
-    PARAMS = {
-        "S": {"buy": 0.04, "sell": 0.037, "moc": 17},
-        "D": {"buy": 0.006, "sell": 0.010, "moc": 25},
-        "N": {"buy": 0.05, "sell": 0.030, "moc": 2}
+  // --- 메인 루프 ---
+  for (let i = 1; i < data.length; i++) {
+    let row = data[i];
+    let dateVal = row[idxDate];
+    if (!(dateVal instanceof Date)) dateVal = new Date(dateVal);
+    if (isNaN(dateVal.getTime())) continue;
+
+    // 날짜 문자열 변환
+    let y = dateVal.getFullYear().toString().slice(-2);
+    let m = ("0" + (dateVal.getMonth() + 1)).slice(-2);
+    let d = ("0" + dateVal.getDate()).slice(-2);
+    let dateKey = `${y}.${m}.${d}`;         // YY.MM.DD (모드검색용)
+    let dateStr = `20${y}-${m}-${d}`;       // YYYY-MM-DD (출력용)
+
+    // 날짜 필터 (25년 1월 2일 부터)
+    if (dateStr < "2025-01-02") continue;
+
+    let O = Number(row[idxOpen]);
+    let H = Number(row[idxHigh]);
+    let L = Number(row[idxLow]);
+    let C = Number(row[idxClose]);
+    let prevC = (i > 1) ? Number(data[i-1][idxClose]) : O;
+
+    // 모드 찾기
+    let mode = "N";
+    let sortedKeys = Object.keys(snd_schedule).sort().reverse();
+    for (let k of sortedKeys) {
+      if (k <= dateKey) { mode = snd_schedule[k]; break; }
+    }
+    let p = PARAMS[mode];
+    let log_event = "";
+
+    // 1. 시드 갱신
+    day_cnt++;
+    if (day_cnt >= cycle) {
+      if (profit_accum > 0) op_seed += profit_accum * 0.9;
+      else op_seed += profit_accum * 0.2;
+      profit_accum = 0;
+      day_cnt = 0;
     }
 
-    for i in range(1, len(df)):
-        date = df.index[i]
-        d_str = date.strftime("%Y-%m-%d")
+    // 2. 매도 (익절 & MOC)
+    let next_pos = [];
+    for (let pos of positions) {
+      let sold = false;
+      
+      // 익절
+      if (H >= pos.target) {
+        let sell_p = Math.max(pos.target, O);
+        let amt = pos.qty * sell_p;
+        cash += amt;
+        profit_accum += (amt - (pos.qty * pos.buy_p));
+        sold = true;
+        log_event += `[✅익절 T${pos.tier}] `;
+      } 
+      // MOC (보유일수 > moc제한)
+      else if (!sold) {
+        let held = Math.floor((dateVal - pos.buy_date) / (1000 * 60 * 60 * 24));
+        if (held > pos.moc) {
+          let sell_p = C;
+          let amt = pos.qty * sell_p;
+          cash += amt;
+          profit_accum += (amt - (pos.qty * pos.buy_p));
+          sold = true;
+          log_event += `[⌛MOC T${pos.tier}] `;
+        }
+      }
+      if (!sold) next_pos.push(pos);
+    }
+    positions = next_pos;
 
-        # 스플릿
-        if d_str in SPLIT_DB:
-            ratio = SPLIT_DB[d_str]
-            for pos in positions:
-                pos['qty'] *= ratio
-                pos['buy_p'] /= ratio
-                pos['target'] /= ratio
+    // 3. 매수
+    let tier = positions.length + 1;
+    if (tier <= 8) {
+      let target_buy = prevC * (1 - p.buy);
+      
+      if (L <= target_buy) {
+        let buy_qty = 0;
+        if ([1,2,3,4,7].includes(tier)) {
+          buy_qty = 1;
+        } else {
+          let base = op_seed / 8;
+          let mul = (tier === 5) ? 3.6 : (tier === 6 ? 3.0 : (tier === 8 ? 4.0 : 0));
+          if (target_buy > 0) buy_qty = Math.floor((base * mul) / target_buy);
+        }
+        
+        if (buy_qty < 1) buy_qty = 1;
+        let buy_p = Math.min(target_buy, O);
+        let cost = buy_qty * buy_p;
+        
+        // 잔고 체크
+        if (cash >= cost) {
+          cash -= cost;
+          positions.push({
+            buy_date: dateVal, buy_p: buy_p, qty: buy_qty,
+            target: buy_p * (1 + p.sell), moc: p.moc, tier: tier
+          });
+          log_event += `[🛒매수 T${tier} ${buy_qty}주] `;
+        }
+      }
+    }
 
-        # 데이터
-        O = float(df['Open'].iloc[i])
-        H = float(df['High'].iloc[i])
-        L = float(df['Low'].iloc[i])
-        C = float(df['Close'].iloc[i])
-        PrevC = float(df['Close'].iloc[i-1])
-
-        mode = get_snd_mode(date)
-        p = PARAMS.get(mode, PARAMS["N"])
-
-        # 1. 시드 갱신
-        day_cnt += 1
-        if day_cnt >= cycle:
-            if profit_accum > 0: op_seed += profit_accum * 0.9
-            else: op_seed += profit_accum * 0.2
-            profit_accum = 0
-            day_cnt = 0
-
-        # 2. 매도
-        next_pos = []
-        for pos in positions:
-            sold = False
-            if H >= pos['target']: # 목표가
-                sell_p = max(pos['target'], O)
-                amt = pos['qty'] * sell_p
-                cash += amt
-                profit_accum += (amt - pos['qty']*pos['buy_p'])
-                sold = True
-            elif not sold: # MOC
-                held = (date - pos['date']).days
-                if held > pos['moc']:
-                    sell_p = C
-                    amt = pos['qty'] * sell_p
-                    cash += amt
-                    profit_accum += (amt - pos['qty']*pos['buy_p'])
-                    sold = True
-            if not sold: next_pos.append(pos)
-        positions = next_pos
-
-        # 3. 매수
-        tier = len(positions) + 1
-        if tier <= 8:
-            target_buy = PrevC * (1 - p["buy"])
-            if L <= target_buy:
-                if tier in [1,2,3,4,7]: qty = 1
-                else:
-                    base = op_seed / 8
-                    if tier==5: mul=3.6
-                    elif tier==6: mul=3.0
-                    elif tier==8: mul=4.0
-                    else: mul=0
-                    qty = int((base * mul) / target_buy)
-                
-                if qty < 1: qty = 1
-                buy_p = min(target_buy, O)
-                cost = qty * buy_p
-                
-                if cash >= cost:
-                    cash -= cost
-                    positions.append({
-                        'date': date, 'buy_p': buy_p, 'qty': qty,
-                        'target': buy_p * (1 + p["sell"]), 'moc': p['moc'], 'tier': tier
-                    })
-
-        # 자산 기록
-        equity = sum([ps['qty'] * C for ps in positions])
-        total = cash + equity
-        history.append({'Date': date, 'Total': total, 'Cash': cash, 'Equity': equity, 'Tier': tier})
-
-    return pd.DataFrame(history)
-
-# ---------------------------------------------------------
-# [2] 웹사이트 UI 구성 (Algori-C 스타일)
-# ---------------------------------------------------------
-st.set_page_config(page_title="3Q Quant Backtest", layout="wide")
-
-# 사이드바 (입력창)
-with st.sidebar:
-    st.title("🎛️ 설정 패널")
-    st.info("Algori-C 스타일 백테스트")
+    // 4. 기록
+    let equity = positions.reduce((sum, pos) => sum + (pos.qty * C), 0);
+    let total = cash + equity;
     
-    uploaded_file = st.file_uploader("📂 RAW.csv 업로드", type=['csv'])
-    start_seed = st.number_input("투자 원금 ($)", value=10000, step=1000)
-    
-    st.divider()
-    st.caption("Developed by Jeongbujang")
+    logs.push([dateStr, mode, positions.length, log_event, cash, equity, total]);
+  }
 
-# 메인 화면
-if uploaded_file is not None:
-    # 데이터 로드
-    df = pd.read_csv(uploaded_file)
-    df.columns = [c.upper().strip() for c in df.columns]
-    df['DATE'] = pd.to_datetime(df['DATE'])
-    df = df.set_index('DATE').sort_index()
-    df = df.rename(columns={'OPEN':'Open','HIGH':'High','LOW':'Low','CLOSE':'Close'})
-    df = df[df.index >= "2025-01-02"]
-
-    # 엔진 실행
-    with st.spinner("백테스트 엔진 가동 중..."):
-        res = run_simulation(df, start_seed)
-
-    # --- [1] 상단 요약 카드 ---
-    final_bal = res['Total'].iloc[-1]
-    total_ret = (final_bal - start_seed) / start_seed * 100
-    mdd = ((res['Total'] / res['Total'].cummax()) - 1).min() * 100
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("최종 자산", f"${final_bal:,.0f}")
-    col2.metric("총 수익률", f"{total_ret:.2f}%", delta_color="normal")
-    col3.metric("최대 낙폭 (MDD)", f"{mdd:.2f}%", delta_color="inverse")
-    col4.metric("총 거래일", f"{len(res)}일")
-
-    # --- [2] 메인 인터랙티브 차트 (Plotly) ---
-    st.subheader("📈 자산 추이 그래프")
-    
-    fig = go.Figure()
-    # 총자산 선
-    fig.add_trace(go.Scatter(
-        x=res['Date'], y=res['Total'], mode='lines', name='총자산',
-        line=dict(color='#00CC96', width=2)
-    ))
-    # 현금 비중 (영역)
-    fig.add_trace(go.Scatter(
-        x=res['Date'], y=res['Cash'], mode='none', name='보유 현금',
-        fill='tozeroy', fillcolor='rgba(99, 110, 250, 0.2)'
-    ))
-    
-    fig.update_layout(
-        height=500,
-        hovermode="x unified", # 마우스 올리면 정보 다 뜸
-        margin=dict(l=0, r=0, t=30, b=0),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)'
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- [3] 상세 데이터 ---
-    st.subheader("📋 일별 상세 데이터")
-    st.dataframe(res.set_index("Date"), use_container_width=True)
-
-else:
-    # 파일 없을 때 대기 화면
-    st.markdown("""
-    ### 👋 안녕하세요, 정부장님.
-    왼쪽 사이드바에 **`RAW.csv`** 파일을 올려주시면 분석이 시작됩니다.
-    
-    **특징:**
-    - 엑셀과 100% 동일한 로직 적용
-    - 인터랙티브 차트 (확대/축소 가능)
-    - 모바일에서도 확인 가능
-    """)
+  // 5. 출력
+  sheetRecord.clear();
+  if (logs.length > 0) {
+    sheetRecord.getRange(1, 1, logs.length, logs[0].length).setValues(logs);
+    Browser.msgBox("✅ 완료! RECORD 시트를 확인하세요. 최종자산: $" + Math.round(logs[logs.length-1][6]));
+  } else {
+    Browser.msgBox("⚠️ 계산된 결과가 없습니다. 날짜나 데이터를 확인하세요.");
+  }
+}
