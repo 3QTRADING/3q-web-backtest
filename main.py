@@ -8,7 +8,7 @@ from datetime import datetime
 st.set_page_config(page_title="3Q SND Tier-Weight Backtester", layout="wide")
 st.title("🚀 3Q 가변 SND + 8분할 비중 시스템")
 
-# [2] SND 데이터 DB (2018~2026) - 엔진 내장
+# [2] SND 데이터 DB (2018~2026)
 SND_DB = {
     "18.01.02": "D", "18.01.08": "N", "18.01.16": "D", "18.01.22": "N", "18.01.29": "D",
     "18.02.05": "D", "18.02.12": "D", "18.02.20": "S", "18.02.26": "S", "18.03.05": "N",
@@ -91,4 +91,130 @@ SND_DB = {
     "25.06.23": "S", "25.06.30": "S", "25.07.07": "N", "25.07.14": "S", "25.07.21": "D",
     "25.07.28": "S", "25.08.04": "D", "25.08.11": "S", "25.08.18": "D", "25.08.25": "D",
     "25.09.02": "D", "25.09.08": "D", "25.09.15": "D", "25.09.22": "D", "25.09.29": "D",
-    "25
+    "25.10.06": "D", "25.10.13": "D", "25.10.20": "D", "25.10.27": "D", "25.11.03": "D",
+    "25.11.10": "D", "25.11.17": "D", "25.11.24": "D", "25.12.01": "S", "25.12.08": "D",
+    "25.12.15": "D", "25.12.22": "D", "25.12.29": "N", "26.01.05": "N", "26.01.12": "N",
+    "26.01.20": "N", "26.01.26": "D", "26.02.02": "D"
+}
+
+def get_snd_mode(target_date):
+    sorted_keys = sorted(SND_DB.keys(), reverse=True)
+    t_str = target_date.strftime("%y.%m.%d")
+    for k in sorted_keys:
+        if k <= t_str: return SND_DB[k]
+    return "N"
+
+# [3] 3Q 가변 SND + 8분할 티어 비중 + 정밀 복리 엔진
+def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
+    cash, shares = seed, 0
+    operating_seed = seed
+    history = []
+    current_tier = 1 
+    accumulated_profit = 0 
+    update_counter = 0
+    
+    # 평단가 관리를 위한 변수 추가
+    avg_price = 0 
+
+    for i in range(1, len(df)):
+        date = df.index[i]
+        prev_close = float(df['Close'].iloc[i-1])
+        curr_low, curr_high, curr_close = float(df['Low'].iloc[i]), float(df['High'].iloc[i]), float(df['Close'].iloc[i])
+        
+        mode = get_snd_mode(date)
+        
+        # --- 복리 반영 로직 (이익/손실 비율 및 주기 설정 반영) ---
+        update_counter += 1
+        if update_counter >= cycle_d:
+            if accumulated_profit > 0:
+                operating_seed += (accumulated_profit * comp_p) 
+            else:
+                operating_seed += (accumulated_profit * comp_l) 
+            
+            # 현금 비중 재조정 (보유 주식 가치 제외한 가용 현금)
+            current_equity = cash + (shares * curr_close)
+            if current_equity > operating_seed: # 자산이 운영금보다 많으면 차액은 유보
+                pass 
+            else:
+                pass # 자산이 줄었으면 그대로 진행
+                
+            accumulated_profit = 0
+            update_counter = 0
+
+        # 모드별 가변 기어 세팅
+        if mode == "S":   b_gear, s_gear, s_type = 0.98, 1.025, "LOC"
+        elif mode == "N": b_gear, s_gear, s_type = 0.96, 1.037, "LOC"
+        else:             b_gear, s_gear, s_type = 0.92, 1.055, "MOC"
+
+        # --- 매수 로직 (8분할 티어 가변 비중 + 평단가 갱신) ---
+        target_buy = np.floor(prev_close * b_gear * 100) / 100
+        if curr_low <= target_buy and current_tier <= 8:
+            if current_tier in [1, 2, 3, 4, 7]: buy_qty = 1 
+            elif current_tier == 5: buy_qty = (operating_seed / 8 / curr_close) * 3.6 
+            elif current_tier == 6: buy_qty = (operating_seed / 8 / curr_close) * 3.0 
+            elif current_tier == 8: buy_qty = (operating_seed / 8 / curr_close) * 4.0 
+            
+            buy_qty = int(buy_qty) if buy_qty >= 1 else 1 # 최소 1주 매수
+            buy_cost = buy_qty * min(target_buy, curr_close)
+            
+            if cash >= buy_cost:
+                # 평단가 갱신 로직 (중요)
+                total_cost_old = shares * avg_price
+                shares += buy_qty
+                avg_price = (total_cost_old + buy_cost) / shares
+                
+                cash -= buy_cost
+                current_tier += 1
+
+        # --- 매도 로직 (익절 시 티어 리셋 및 수익 적립) ---
+        target_sell = round(prev_close * s_gear, 2)
+        if curr_high >= target_sell and shares > 0:
+            sell_price = curr_close if s_type == "MOC" else target_sell
+            sell_val = shares * sell_price
+            
+            # 수익 계산 (매도금 - (보유수량 * 평단가))
+            profit = sell_val - (shares * avg_price) 
+            accumulated_profit += profit
+            
+            cash += sell_val * (1 - fee)
+            shares = 0
+            current_tier = 1
+            avg_price = 0 # 매도 후 평단가 초기화
+
+        history.append({'Date': date, 'Total': cash + (shares * curr_close), 'Mode': mode})
+    return pd.DataFrame(history)
+
+# [4] 사이드바 사용자 입력란
+with st.sidebar:
+    st.header("📋 백테스트 설정")
+    ticker = st.text_input("분석 종목 (Ticker)", value="QLD").upper()
+    
+    min_d, max_d = datetime(2018, 1, 1), datetime(2026, 1, 31)
+    col1, col2 = st.columns(2)
+    s_date = col1.date_input("시작일", value=datetime(2025, 1, 1), min_value=min_d, max_value=max_d)
+    e_date = col2.date_input("종료일", value=max_d, min_value=min_d, max_value=max_d)
+    
+    seed = st.number_input("초기 원금 ($)", value=10000, step=1000)
+    fee_rate = st.number_input("거래 수수료 (%)", value=0.0, format="%.3f") / 100
+    
+    st.divider()
+    st.header("🔄 복리 및 갱신 정책")
+    comp_profit = st.slider("이익 복리 반영 비율 (%)", 0, 100, 90) / 100
+    comp_loss = st.slider("손실 복리 반영 비율 (%)", 0, 100, 20) / 100
+    update_cycle = st.number_input("반영 갱신 주기 (일)", value=6, min_value=1)
+
+# [5] 메인 화면 실행 및 결과
+if st.button("📊 3Q 가변 엔진 실행", type="primary", use_container_width=True):
+    with st.spinner("복리 연산 및 가변 비중 분석 중..."):
+        df_raw = yf.download(ticker, start=s_date, end=e_date, auto_adjust=True)
+        if not df_raw.empty:
+            res = run_3q_engine(df_raw, seed, fee_rate, comp_profit, comp_loss, update_cycle)
+            
+            final_val = res['Total'].iloc[-1]
+            st.subheader(f"🏁 {ticker} 성과 분석 결과")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("최종 자산", f"${final_val:,.2f}")
+            c2.metric("총 수익률", f"{(final_val/seed-1)*100:.2f}%")
+            c3.metric("최대 자산", f"${res['Total'].max():,.2f}")
+            
+            st.line_chart(res.set_index('Date')['Total'])
