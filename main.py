@@ -4,11 +4,11 @@ import yfinance as yf
 import numpy as np
 from datetime import datetime, timedelta
 
-# [1] 페이지 및 레이아웃 설정
-st.set_page_config(page_title="3Q SND Tier-Weight Backtester", layout="wide")
-st.title("🚀 3Q 티어별 독립 매매 시스템 (데이터 정밀 검증판)")
+# [1] 페이지 설정
+st.set_page_config(page_title="3Q Independent Tier Backtester", layout="wide")
+st.title("🚀 3Q 티어별 독립 매매 시스템 (엑셀 동기화 버전)")
 
-# [2] SND 데이터 DB (2018~2026)
+# [2] SND 모드 DB (2018~2026)
 SND_DB = {
     "18.01.02": "D", "18.01.08": "N", "18.01.16": "D", "18.01.22": "N", "18.01.29": "D",
     "18.02.05": "D", "18.02.12": "D", "18.02.20": "S", "18.02.26": "S", "18.03.05": "N",
@@ -104,7 +104,7 @@ def get_snd_mode(target_date):
         if k <= t_str: return SND_DB[k]
     return "N"
 
-# [3] 3Q 티어별 독립 실행 엔진 (SND 파라미터 + 티어별 개별 청산)
+# [3] 3Q 독립 실행 엔진
 def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
     cash = seed
     operating_seed = seed
@@ -112,9 +112,11 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
     accumulated_profit = 0
     update_counter = 0
 
-    positions = [] # {매수일, 매수가, 수량, 목표가, 만기일}
+    # positions: 보유 중인 티어 리스트
+    # 각 요소: {매수일, 매수가, 수량, 목표가, 만기일(MOC날짜), 모드}
+    positions = []
 
-    # 이미지 파라미터 (매수%, 매도%, MOC일수)
+    # 이미지 파라미터
     PARAMS = {
         "S": {"buy": 0.04,  "sell": 0.037, "moc": 17},
         "D": {"buy": 0.006, "sell": 0.010, "moc": 25},
@@ -124,6 +126,9 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
     for i in range(1, len(df)):
         current_date = df.index[i]
         prev_close = float(df['Close'].iloc[i-1])
+        
+        # 야후 데이터는 수정주가 미반영시 Open/High/Low/Close가 명확함
+        curr_open = float(df['Open'].iloc[i])
         curr_low = float(df['Low'].iloc[i])
         curr_high = float(df['High'].iloc[i])
         curr_close = float(df['Close'].iloc[i])
@@ -131,7 +136,7 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
         mode = get_snd_mode(current_date)
         p = PARAMS.get(mode, PARAMS["N"])
 
-        # --- [1] 복리 반영 ---
+        # --- [1] 시드 갱신 (복리) ---
         update_counter += 1
         if update_counter >= cycle_d:
             if accumulated_profit > 0:
@@ -141,40 +146,57 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
             accumulated_profit = 0
             update_counter = 0
 
-        # --- [2] 매도 로직 (개별 티어 검사) ---
+        # --- [2] 매도 체크 (보유 물량 개별 확인) ---
+        # 엑셀처럼 각 물량이 독립적으로 목표가/만기를 가짐
         next_positions = []
         
         for pos in positions:
             is_sold = False
             
-            # (A) 목표가 익절
+            # (A) 목표가 익절 (매수된 가격 기준 + 목표%)
+            # 엑셀: '매도목표'가 고정되어 있음.
             if curr_high >= pos['target_price']:
-                sell_val = pos['qty'] * pos['target_price']
+                # 보수적 계산: 목표가가 시가보다 낮으면 시가 매도, 아니면 목표가 매도
+                sell_price = pos['target_price']
+                if curr_open > sell_price: sell_price = curr_open 
+                
+                sell_val = pos['qty'] * sell_price
                 profit = sell_val - (pos['qty'] * pos['buy_price'])
                 
                 cash += sell_val * (1 - fee)
                 accumulated_profit += profit
                 is_sold = True
             
-            # (B) MOC 청산
-            elif not is_sold and (current_date - pos['buy_date']).days >= pos['moc_limit_days']:
-                sell_val = pos['qty'] * curr_close
-                profit = sell_val - (pos['qty'] * pos['buy_price'])
-                
-                cash += sell_val * (1 - fee)
-                accumulated_profit += profit
-                is_sold = True
+            # (B) MOC 만기 청산
+            # 엑셀: MOC 날짜가 되면 종가 청산
+            # 보유일수 = (오늘 - 매수일).days
+            elif not is_sold:
+                held_days = (current_date - pos['buy_date']).days
+                if held_days >= pos['moc_limit_days']:
+                    sell_val = pos['qty'] * curr_close
+                    profit = sell_val - (pos['qty'] * pos['buy_price'])
+                    
+                    cash += sell_val * (1 - fee)
+                    accumulated_profit += profit
+                    is_sold = True
             
             if not is_sold:
                 next_positions.append(pos)
         
         positions = next_positions
 
-        # --- [3] 매수 로직 (빈 티어 채우기) ---
-        current_tier_index = len(positions) + 1
+        # --- [3] 매수 체크 (독립 티어 진입) ---
+        # 엑셀: 매일 '전일종가' 기준 하락폭 계산하여 주문
         target_buy_price = prev_close * (1 - p["buy"])
+        
+        # 현재 보유중인 티어 수 = 리스트 길이
+        current_tier_index = len(positions) + 1
 
+        # 주문 가격보다 저가가 낮으면 체결 (Limit Order)
         if curr_low <= target_buy_price and current_tier_index <= 8:
+            
+            # 티어별 가중치 (엑셀 로직 추정 및 일반적 3Q 룰)
+            # 1~4, 7티어: 1배수 / 5,6,8티어: 가중치
             if current_tier_index in [1, 2, 3, 4, 7]: unit_multiplier = 1.0
             elif current_tier_index == 5: unit_multiplier = 3.6
             elif current_tier_index == 6: unit_multiplier = 3.0
@@ -182,21 +204,27 @@ def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
             else: unit_multiplier = 1.0
 
             buy_amt = (operating_seed / 8) * unit_multiplier
-            buy_qty = int(buy_amt / curr_close)
-            if buy_qty < 1: buy_qty = 1 
+            buy_qty = int(buy_amt / target_buy_price) # 수량은 타겟가 기준 계산
+            if buy_qty < 1: buy_qty = 1
 
-            buy_price = min(target_buy_price, curr_close)
+            # 실제 체결가: 타겟가보다 시가가 낮게 시작했으면 시가체결, 아니면 타겟가 체결
+            buy_price = target_buy_price
+            if curr_open < target_buy_price: buy_price = curr_open
+
             buy_cost = buy_qty * buy_price
 
             if cash >= buy_cost:
                 cash -= buy_cost
+                
+                # [중요] 진입 시점에 목표가와 만기를 확정하여 저장
                 new_pos = {
                     'buy_date': current_date,
                     'buy_price': buy_price,
                     'qty': buy_qty,
-                    'target_price': buy_price * (1 + p["sell"]), 
-                    'moc_limit_days': p["moc"],
-                    'tier': current_tier_index
+                    'target_price': buy_price * (1 + p["sell"]), # 익절가 고정
+                    'moc_limit_days': p["moc"], # 만기일수 고정
+                    'tier': current_tier_index,
+                    'mode': mode
                 }
                 positions.append(new_pos)
 
@@ -222,35 +250,39 @@ with st.sidebar:
     fee_rate = st.number_input("거래 수수료 (%)", value=0.0, format="%.3f") / 100
     
     st.divider()
-    st.header("🔄 복리 및 갱신 정책")
-    comp_profit = st.slider("이익 복리 반영 비율 (%)", 0, 100, 90) / 100
-    comp_loss = st.slider("손실 복리 반영 비율 (%)", 0, 100, 20) / 100
-    update_cycle = st.number_input("반영 갱신 주기 (일)", value=6, min_value=1)
+    st.header("🔄 복리 정책")
+    comp_profit = st.slider("이익 복리 반영 (%)", 0, 100, 90) / 100
+    comp_loss = st.slider("손실 복리 반영 (%)", 0, 100, 20) / 100
+    update_cycle = st.number_input("갱신 주기 (일)", value=6, min_value=1)
 
 # [5] 메인 실행
-if st.button("📊 3Q 독립 엔진 실행", type="primary", use_container_width=True):
-    with st.spinner("야후 파이낸스 데이터 로딩 중 (Raw Data)..."):
-        # [중요] auto_adjust=False 로 설정하여 수정주가 미반영 (액면가) 데이터 호출
+if st.button("📊 3Q 독립 엔진 실행 (엑셀 동기화)", type="primary", use_container_width=True):
+    with st.spinner("데이터 동기화 및 티어별 분석 중..."):
+        # [핵심] auto_adjust=False: 야후의 수정주가를 끄고 '장중 실제가격'을 가져옴
         df_raw = yf.download(ticker, start=s_date, end=e_date, auto_adjust=False)
         
         if not df_raw.empty:
-            # MultiIndex 컬럼 문제 해결 (Adj Close 등 제거하고 Close만 사용)
+            # MultiIndex 컬럼 문제 처리
             if isinstance(df_raw.columns, pd.MultiIndex):
                 df_raw.columns = df_raw.columns.get_level_values(0)
             
-            # 데이터 검증용 표 출력
-            st.write("### 🔍 데이터 정합성 확인 (Raw Close)")
-            st.dataframe(df_raw[['Open', 'High', 'Low', 'Close']].tail(5))
+            # 데이터 검증용 탭
+            tab1, tab2 = st.tabs(["📈 성과 분석", "🔍 데이터 검증"])
             
-            res = run_3q_engine(df_raw, seed, fee_rate, comp_profit, comp_loss, update_cycle)
-            
-            final_val = res['Total'].iloc[-1]
-            st.subheader(f"🏁 {ticker} 성과 분석 결과")
-            
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("최종 자산", f"${final_val:,.2f}")
-            c2.metric("총 수익률", f"{(final_val/seed-1)*100:.2f}%")
-            c3.metric("최대 자산", f"${res['Total'].max():,.2f}")
-            c4.metric("최대 보유 티어", f"{res['Active_Tiers'].max()} Tier")
-            
-            st.line_chart(res.set_index('Date')['Total'])
+            with tab1:
+                res = run_3q_engine(df_raw, seed, fee_rate, comp_profit, comp_loss, update_cycle)
+                final_val = res['Total'].iloc[-1]
+                
+                st.subheader(f"🏁 {ticker} 최종 성과")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("최종 자산", f"${final_val:,.2f}")
+                c2.metric("총 수익률", f"{(final_val/seed-1)*100:.2f}%")
+                c3.metric("최대 자산", f"${res['Total'].max():,.2f}")
+                c4.metric("최대 티어 사용", f"{res['Active_Tiers'].max()} Tier")
+                
+                st.line_chart(res.set_index('Date')['Total'])
+
+            with tab2:
+                st.markdown("### 🔍 야후 파이낸스 원본 데이터 (Raw Price)")
+                st.markdown("> **확인:** 엑셀 매매일지의 가격과 아래 표의 `Close`(종가), `Low`(저가)가 일치하는지 확인하십시오.")
+                st.dataframe(df_raw[['Open', 'High', 'Low', 'Close']].style.format("{:.2f}"))
