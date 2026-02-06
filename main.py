@@ -2,15 +2,16 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import plotly.graph_objects as go
 
 # [1] 페이지 설정
-st.set_page_config(page_title="3Q SND Pro Backtester", layout="wide")
-st.title("🚀 3Q 실전 가변 SND 백테스트 시스템")
+st.set_page_config(page_title="3Q SND Tier-Weight Backtester", layout="wide")
+st.title("🚀 3Q 가변 SND + 8분할 비중 시스템")
+st.info("1~4티어(1주), 5티어(3.6배), 6티어(3배), 7티어(1주), 8티어(4배) 비중 조절 로직 적용") [cite: 2025-12-31]
 
-# [2] SND 데이터 (2011~2026) - 엔진 내장
-SND_DATA = {
+# [2] SND 데이터 DB (부장님 제공 데이터 2018~2026) [cite: 2025-12-31]
+SND_DB = {
     "18.01.02": "D", "18.01.08": "N", "18.01.16": "D", "18.01.22": "N", "18.01.29": "D",
     "18.02.05": "D", "18.02.12": "D", "18.02.20": "S", "18.02.26": "S", "18.03.05": "N",
     "18.03.12": "S", "18.03.19": "N", "18.03.26": "D", "18.04.02": "N", "18.04.09": "N",
@@ -98,92 +99,88 @@ SND_DATA = {
     "26.01.20": "N", "26.01.26": "D", "26.02.02": "D"
 }
 
-# 날짜에 맞는 SND 모드 호출
 def get_snd_mode(target_date):
-    sorted_dates = sorted(SND_DATA.keys(), reverse=True)
-    target_str = target_date.strftime("%y.%m.%d")
-    for d in sorted_dates:
-        if d <= target_str:
-            return SND_DATA[d]
+    sorted_keys = sorted(SND_DB.keys(), reverse=True)
+    t_str = target_date.strftime("%y.%m.%d")
+    for k in sorted_keys:
+        if k <= t_str: return SND_DB[k]
     return "N"
 
-# [3] 가변 SND 엔진 로직
-def run_3q_variable_engine(df, seed, fee_rate):
+# [3] 가변 SND + 8분할 티어 비중 엔진 [cite: 2025-12-31]
+def run_3q_tier_engine(df, seed, fee=0):
     cash, shares = seed, 0
     history = []
+    current_tier = 1 # 1분할부터 시작
     
     for i in range(1, len(df)):
         date = df.index[i]
         prev_close = float(df['Close'].iloc[i-1])
-        curr_low = float(df['Low'].iloc[i])
-        curr_high = float(df['High'].iloc[i])
-        curr_close = float(df['Close'].iloc[i])
+        curr_low, curr_high, curr_close = float(df['Low'].iloc[i]), float(df['High'].iloc[i]), float(df['Close'].iloc[i])
         
         mode = get_snd_mode(date)
         
         # 모드별 가변 기어 세팅
-        if mode == "S":   # Safe
-            b_gear, s_gear, s_type = 0.98, 1.025, "LOC"
-        elif mode == "N": # Normal
-            b_gear, s_gear, s_type = 0.96, 1.037, "LOC"
-        else:             # Danger
-            b_gear, s_gear, s_type = 0.92, 1.055, "MOC"
+        if mode == "S":   b_gear, s_gear, s_type = 0.98, 1.025, "LOC"
+        elif mode == "N": b_gear, s_gear, s_type = 0.96, 1.037, "LOC"
+        else:             b_gear, s_gear, s_type = 0.92, 1.055, "MOC"
 
-        # 매수 (1/8 비중)
+        # --- 매수 로직 (8분할 티어 비중 적용) [cite: 2025-12-31] ---
         target_buy = np.floor(prev_close * b_gear * 100) / 100
-        if curr_low <= target_buy:
-            buy_limit = seed / 8
-            if cash >= buy_limit:
-                exec_p = min(target_buy, curr_close)
-                qty = buy_limit / exec_p
-                cash -= (buy_limit * (1 + fee_rate))
-                shares += qty
+        
+        if curr_low <= target_buy and current_tier <= 8:
+            # 티어별 비중 계산 [cite: 2025-12-31]
+            if current_tier in [1, 2, 3, 4, 7]: 
+                buy_qty = 1 # 1~4티어, 7티어는 무조건 1주 [cite: 2025-12-31]
+            elif current_tier == 5: 
+                buy_qty = (seed / 8 / curr_close) * 3.6 # 5티어: 3.6배 [cite: 2025-12-31]
+            elif current_tier == 6: 
+                buy_qty = (seed / 8 / curr_close) * 3.0 # 6티어: 3배 [cite: 2025-12-31]
+            elif current_tier == 8: 
+                buy_qty = (seed / 8 / curr_close) * 4.0 # 8티어: 4배 [cite: 2025-12-31]
+            
+            buy_cost = buy_qty * min(target_buy, curr_close)
+            if cash >= buy_cost:
+                cash -= buy_cost
+                shares += buy_qty
+                current_tier += 1 # 다음 티어로 이동
 
-        # 매도
+        # --- 매도 로직 (익절 시 티어 리셋) [cite: 2025-12-31] ---
         target_sell = round(prev_close * s_gear, 2)
         if curr_high >= target_sell and shares > 0:
-            sell_p = curr_close if s_type == "MOC" else target_sell
-            cash += shares * sell_p * (1 - fee_rate)
+            sell_price = curr_close if s_type == "MOC" else target_sell
+            cash += shares * sell_price
             shares = 0
+            current_tier = 1 # 익절 시 다시 1티어로 리셋 [cite: 2025-12-31]
 
-        history.append({'날짜': date, '총자산': cash + (shares * curr_close), '모드': mode})
+        history.append({'Date': date, 'Total': cash + (shares * curr_close), 'Mode': mode, 'Tier': current_tier - 1})
     return pd.DataFrame(history)
 
-# [4] 사이드바 (사용자 설정 개방) [cite: 2025-12-31]
+# [4] 사이드바 및 UI
 with st.sidebar:
-    st.header("📝 백테스트 설정")
+    st.header("⚙️ 백테스트 설정")
     ticker = st.text_input("종목 심볼", value="QLD").upper()
-    
-    # 기본 시작일을 25년 1월로 설정
-    col1, col2 = st.columns(2)
-    s_date = col1.date_input("시작일", datetime(2025, 1, 1))
-    e_date = col2.date_input("종료일", datetime(2026, 1, 31))
-    
-    # 시작 원금 및 수수료 설정 자유화
-    seed_input = st.number_input("초기 자본 ($)", value=10000, step=1000)
-    fee_input = st.number_input("수수료 (%)", value=0.0, format="%.3f") / 100
+    min_d, max_d = datetime(2018, 1, 1), datetime(2026, 1, 31)
+    s_date = st.date_input("시작일", value=datetime(2025, 1, 1), min_value=min_d, max_value=max_d)
+    e_date = st.date_input("종료일", value=max_d, min_value=min_d, max_value=max_d)
+    seed = st.number_input("초기 원금 ($)", value=10000)
+    st.info("비중: 1-4T(1주), 5T(3.6배), 6T(3배), 7T(1주), 8T(4배)") [cite: 2025-12-31]
 
-# [5] 실행 및 결과 출력
-if st.button("📊 SND 가변 백테스트 실행", type="primary", use_container_width=True):
-    with st.spinner("데이터 분석 중..."):
+if st.button("📊 8분할 티어 백테스트 실행", type="primary", use_container_width=True):
+    with st.spinner("가변 비중 엔진 가동 중..."):
         df_raw = yf.download(ticker, start=s_date, end=e_date, auto_adjust=True)
-        
         if not df_raw.empty:
-            res = run_3q_variable_engine(df_raw, seed_input, fee_input)
+            res = run_3q_tier_engine(df_raw, seed)
             
-            # 지표 (U17~U21 구조)
-            final_val = res['총자산'].iloc[-1]
-            st.subheader(f"🏁 {ticker} 가변 SND 분석 결과")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("최종 자산", f"${final_val:,.2f}")
-            m2.metric("총 수익률", f"{(final_val/seed_input-1)*100:.2f}%")
-            m3.metric("최종 판별 모드", res['모드'].iloc[-1])
+            # 성과 지표
+            final_val = res['Total'].iloc[-1]
+            st.subheader(f"🏁 {ticker} 8분할 성과 보고서")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("최종 자산", f"${final_val:,.2f}")
+            c2.metric("수익률", f"{(final_val/seed-1)*100:.2f}%")
+            c3.metric("최대 도달 티어", f"{res['Tier'].max()}단계")
             
-            # 차트
+            # 자산 변화 그래프
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=res['날짜'], y=res['총자산'], name="자산 변화", line=dict(color="#3b82f6", width=2)))
+            fig.add_trace(go.Scatter(x=res['Date'], y=res['Total'], name="자산 변화", line=dict(color="#3b82f6", width=2)))
             fig.update_layout(hovermode="x unified", template="plotly_white")
             st.plotly_chart(fig, use_container_width=True)
-            
-        else:
-            st.error("데이터 로드 실패")
