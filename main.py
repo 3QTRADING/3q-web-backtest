@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # [1] 페이지 및 레이아웃 설정
 st.set_page_config(page_title="3Q SND Tier-Weight Backtester", layout="wide")
-st.title("🚀 3Q 가변 SND + 8분할 비중 시스템")
+st.title("🚀 3Q 티어별 독립 매매 시스템 (개별 MOC/익절 적용)")
 
 # [2] SND 데이터 DB (2018~2026)
 SND_DB = {
@@ -104,84 +104,126 @@ def get_snd_mode(target_date):
         if k <= t_str: return SND_DB[k]
     return "N"
 
-# [3] 3Q 가변 SND + 8분할 티어 비중 + 정밀 복리 엔진
+# [3] 3Q 티어별 독립 실행 엔진 (SND 파라미터 + 티어별 개별 청산)
 def run_3q_engine(df, seed, fee, comp_p, comp_l, cycle_d):
-    cash, shares = seed, 0
+    cash = seed
     operating_seed = seed
     history = []
-    current_tier = 1 
-    accumulated_profit = 0 
+    accumulated_profit = 0
     update_counter = 0
-    
-    # 평단가 관리를 위한 변수 추가
-    avg_price = 0 
+
+    # 보유 포지션 리스트 (각 요소는 딕셔너리: {매수일, 매수가, 수량, 목표가, 만기일})
+    positions = []
+
+    # 이미지 파라미터 (매수%, 매도%, MOC일수)
+    PARAMS = {
+        "S": {"buy": 0.04,  "sell": 0.037, "moc": 17},
+        "D": {"buy": 0.006, "sell": 0.010, "moc": 25},
+        "N": {"buy": 0.05,  "sell": 0.030, "moc": 2}
+    }
 
     for i in range(1, len(df)):
-        date = df.index[i]
+        current_date = df.index[i]
         prev_close = float(df['Close'].iloc[i-1])
-        curr_low, curr_high, curr_close = float(df['Low'].iloc[i]), float(df['High'].iloc[i]), float(df['Close'].iloc[i])
-        
-        mode = get_snd_mode(date)
-        
-        # --- 복리 반영 로직 (이익/손실 비율 및 주기 설정 반영) ---
+        curr_low = float(df['Low'].iloc[i])
+        curr_high = float(df['High'].iloc[i])
+        curr_close = float(df['Close'].iloc[i])
+
+        mode = get_snd_mode(current_date)
+        p = PARAMS.get(mode, PARAMS["N"])
+
+        # --- [1] 복리 반영 로직 (주기별 시드 갱신) ---
         update_counter += 1
         if update_counter >= cycle_d:
             if accumulated_profit > 0:
-                operating_seed += (accumulated_profit * comp_p) 
+                operating_seed += (accumulated_profit * comp_p)
             else:
-                operating_seed += (accumulated_profit * comp_l) 
-            
-            # 현금 비중 재조정 (보유 주식 가치 제외한 가용 현금)
-            current_equity = cash + (shares * curr_close)
-            if current_equity > operating_seed: # 자산이 운영금보다 많으면 차액은 유보
-                pass 
-            else:
-                pass # 자산이 줄었으면 그대로 진행
-                
+                operating_seed += (accumulated_profit * comp_l)
             accumulated_profit = 0
             update_counter = 0
 
-        # 모드별 가변 기어 세팅
-        if mode == "S":   b_gear, s_gear, s_type = 0.98, 1.025, "LOC"
-        elif mode == "N": b_gear, s_gear, s_type = 0.96, 1.037, "LOC"
-        else:             b_gear, s_gear, s_type = 0.92, 1.055, "MOC"
-
-        # --- 매수 로직 (8분할 티어 가변 비중 + 평단가 갱신) ---
-        target_buy = np.floor(prev_close * b_gear * 100) / 100
-        if curr_low <= target_buy and current_tier <= 8:
-            if current_tier in [1, 2, 3, 4, 7]: buy_qty = 1 
-            elif current_tier == 5: buy_qty = (operating_seed / 8 / curr_close) * 3.6 
-            elif current_tier == 6: buy_qty = (operating_seed / 8 / curr_close) * 3.0 
-            elif current_tier == 8: buy_qty = (operating_seed / 8 / curr_close) * 4.0 
+        # --- [2] 매도 로직 (보유 중인 모든 '개별 티어' 검사) ---
+        # 중요: for문을 돌면서 리스트를 수정(삭제)해야 하므로 역순 순회 혹은 새 리스트 생성
+        next_positions = []
+        
+        for pos in positions:
+            is_sold = False
             
-            buy_qty = int(buy_qty) if buy_qty >= 1 else 1 # 최소 1주 매수
-            buy_cost = buy_qty * min(target_buy, curr_close)
-            
-            if cash >= buy_cost:
-                # 평단가 갱신 로직 (중요)
-                total_cost_old = shares * avg_price
-                shares += buy_qty
-                avg_price = (total_cost_old + buy_cost) / shares
+            # (A) 개별 목표가 익절 체크 (High가 목표가 이상이면 익절)
+            if curr_high >= pos['target_price']:
+                sell_val = pos['qty'] * pos['target_price']
+                profit = sell_val - (pos['qty'] * pos['buy_price'])
                 
+                cash += sell_val * (1 - fee)
+                accumulated_profit += profit
+                is_sold = True
+            
+            # (B) 개별 MOC 청산 체크 (보유일수 >= MOC한계일 이면 종가 청산)
+            # 아직 안 팔렸고, 오늘 날짜가 만기일(moc_date) 이후라면
+            elif not is_sold and (current_date - pos['buy_date']).days >= pos['moc_limit_days']:
+                sell_val = pos['qty'] * curr_close
+                profit = sell_val - (pos['qty'] * pos['buy_price'])
+                
+                cash += sell_val * (1 - fee)
+                accumulated_profit += profit
+                is_sold = True
+            
+            # (C) 안 팔렸으면 유지
+            if not is_sold:
+                next_positions.append(pos)
+        
+        positions = next_positions # 리스트 갱신
+
+        # --- [3] 매수 로직 (빈 티어 채우기) ---
+        # "티어별 별도 계산" -> 현재 보유 중인 포지션 수 = 현재 사용 중인 티어 수
+        # 예: 0개 보유 -> 1티어 매수, 2개 보유 -> 3티어 매수
+        
+        current_tier_index = len(positions) + 1 # 현재 진입할 티어 번호
+        target_buy_price = prev_close * (1 - p["buy"])
+
+        if curr_low <= target_buy_price and current_tier_index <= 8:
+            # 8분할 티어별 비중 계산 (이미지와 동일한 로직 적용)
+            # 통상 1~4,7티어: 1유닛 / 5,6,8티어: 가중치 부여
+            if current_tier_index in [1, 2, 3, 4, 7]: 
+                unit_multiplier = 1.0
+            elif current_tier_index == 5: 
+                unit_multiplier = 3.6
+            elif current_tier_index == 6: 
+                unit_multiplier = 3.0
+            elif current_tier_index == 8: 
+                unit_multiplier = 4.0
+            else:
+                unit_multiplier = 1.0
+
+            # 1유닛 기준 금액 = (운영자금 / 8)
+            buy_amt = (operating_seed / 8) * unit_multiplier
+            buy_qty = int(buy_amt / curr_close)
+            if buy_qty < 1: buy_qty = 1 # 최소 1주
+
+            buy_price = min(target_buy_price, curr_close) # 매수 체결가
+            buy_cost = buy_qty * buy_price
+
+            if cash >= buy_cost:
                 cash -= buy_cost
-                current_tier += 1
+                
+                # [중요] 신규 포지션 등록 (개별 목표가, MOC일수 기록)
+                new_pos = {
+                    'buy_date': current_date,
+                    'buy_price': buy_price,
+                    'qty': buy_qty,
+                    'target_price': buy_price * (1 + p["sell"]), # 진입 시점의 목표가 고정
+                    'moc_limit_days': p["moc"], # 진입 시점의 MOC 일수 고정
+                    'tier': current_tier_index
+                }
+                positions.append(new_pos)
 
-        # --- 매도 로직 (익절 시 티어 리셋 및 수익 적립) ---
-        target_sell = round(prev_close * s_gear, 2)
-        if curr_high >= target_sell and shares > 0:
-            sell_price = curr_close if s_type == "MOC" else target_sell
-            sell_val = shares * sell_price
-            
-            # 수익 계산 (매도금 - (보유수량 * 평단가))
-            profit = sell_val - (shares * avg_price) 
-            accumulated_profit += profit
-            
-            cash += sell_val * (1 - fee)
-            shares = 0
-            current_tier = 1
-            avg_price = 0 # 매도 후 평단가 초기화
-
-        history.append({'Date': date, 'Total': cash + (shares * curr_close), 'Mode': mode})
+        # --- [4] 자산 평가 ---
+        # 현재 총 자산 = 현금 + 보유 중인 모든 포지션의 현재가치 합
+        equity_val = sum([p['qty'] * curr_close for p in positions])
+        total_asset = cash + equity_val
+        
+        history.append({'Date': current_date, 'Total': total_asset, 'Mode': mode, 'Active_Tiers': len(positions)})
+        
     return pd.DataFrame(history)
 
 # [4] 사이드바 사용자 입력란
@@ -202,19 +244,23 @@ with st.sidebar:
     comp_profit = st.slider("이익 복리 반영 비율 (%)", 0, 100, 90) / 100
     comp_loss = st.slider("손실 복리 반영 비율 (%)", 0, 100, 20) / 100
     update_cycle = st.number_input("반영 갱신 주기 (일)", value=6, min_value=1)
+    
+    st.success("✅ 3Q 개별 티어 독립 시스템 적용됨\n(SND 이미지 파라미터 기준)")
 
 # [5] 메인 화면 실행 및 결과
-if st.button("📊 3Q 가변 엔진 실행", type="primary", use_container_width=True):
-    with st.spinner("복리 연산 및 가변 비중 분석 중..."):
+if st.button("📊 3Q 독립 엔진 실행", type="primary", use_container_width=True):
+    with st.spinner("티어별 개별 추적 시뮬레이션 중..."):
         df_raw = yf.download(ticker, start=s_date, end=e_date, auto_adjust=True)
         if not df_raw.empty:
             res = run_3q_engine(df_raw, seed, fee_rate, comp_profit, comp_loss, update_cycle)
             
             final_val = res['Total'].iloc[-1]
-            st.subheader(f"🏁 {ticker} 성과 분석 결과")
-            c1, c2, c3 = st.columns(3)
+            st.subheader(f"🏁 {ticker} 성과 분석 결과 (Independent Tiers)")
+            
+            c1, c2, c3, c4 = st.columns(4)
             c1.metric("최종 자산", f"${final_val:,.2f}")
             c2.metric("총 수익률", f"{(final_val/seed-1)*100:.2f}%")
             c3.metric("최대 자산", f"${res['Total'].max():,.2f}")
+            c4.metric("최대 보유 티어", f"{res['Active_Tiers'].max()} Tier")
             
             st.line_chart(res.set_index('Date')['Total'])
